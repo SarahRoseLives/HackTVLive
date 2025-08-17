@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"math"
-	"os"
 	"os/exec"
 	"runtime"
 	"sync"
@@ -175,27 +174,12 @@ func (n *NTSC) ireToAmplitude(ire float64) float64 {
 
 func main() {
 	// --- Command-Line Flag Setup ---
-	freq := flag.Float64("freq", 0, "Transmit frequency in MHz (required)")
-	sampleRate := flag.Int("samplerate", 8000000, "Sample rate in Hz")
-	gain := flag.Int("gain", 47, "TX VGA gain (0-47)")
+	freq := flag.Float64("freq", 427.25, "Transmit frequency in MHz")
+	bw := flag.Float64("bw", 8.0, "Channel bandwidth in MHz")
+	gain := flag.Int("gain", 40, "TX VGA gain (0-47)")
 	device := flag.String("device", "", "Video device name or index (OS-dependent, see instructions)")
-	callsign := flag.String("callsign", "", "Callsign to overlay on the video (optional)")
-	rtl := flag.Bool("rtl", false, "Enable 2.4 MHz RTL mode (signal output at 2.4 MHz)")
+	callsign := flag.String("callsign", "NOCALL", "Callsign to overlay on the video")
 	flag.Parse()
-
-	if *freq == 0 {
-		fmt.Println("Usage: ./tvtx -freq <mhz> -device <name_or_index> [-callsign <callsign>] [-rtl]")
-		fmt.Println("\nThis program captures a webcam and transmits it as NTSC video.")
-		fmt.Println("\nStep 1: Find your webcam's name or index (see README).")
-		fmt.Println("Step 2: Run this program with the correct arguments.")
-		fmt.Println("\nExample (Linux):    ./tvtx -freq 427.25 -device /dev/video0 -callsign N0CALL")
-		fmt.Println("Example (macOS):    ./tvtx -freq 427.25 -device 0 -callsign N0CALL")
-		fmt.Println("Example (Windows):  ./tvtx -freq 427.25 -device \"Integrated Webcam\" -callsign N0CALL")
-		fmt.Println("Example (RTL mode): ./tvtx -freq 427.25 -device /dev/video0 -rtl")
-		fmt.Println("\nOptions:")
-		flag.PrintDefaults()
-		os.Exit(1)
-	}
 
 	// --- Build the FFmpeg command based on the operating system ---
 	var ffmpegArgs []string
@@ -272,13 +256,7 @@ func main() {
 	defer dev.Close()
 
 	txFrequencyHz := uint64(*freq * 1_000_000)
-
-	var outputFrequency float64
-	if *rtl {
-		outputFrequency = 2_400_000
-	} else {
-		outputFrequency = float64(*sampleRate)
-	}
+	outputFrequency := *bw * 1_000_000 // Use BW as sample rate
 
 	// Set HackRF frequency and sample rate
 	if err := dev.SetFreq(txFrequencyHz); err != nil {
