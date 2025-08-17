@@ -180,16 +180,18 @@ func main() {
 	gain := flag.Int("gain", 47, "TX VGA gain (0-47)")
 	device := flag.String("device", "", "Video device name or index (OS-dependent, see instructions)")
 	callsign := flag.String("callsign", "", "Callsign to overlay on the video (optional)")
+	rtl := flag.Bool("rtl", false, "Enable 2.4 MHz RTL mode (signal output at 2.4 MHz)")
 	flag.Parse()
 
 	if *freq == 0 {
-		fmt.Println("Usage: ./tvtx -freq <mhz> -device <name_or_index> [-callsign <callsign>]")
+		fmt.Println("Usage: ./tvtx -freq <mhz> -device <name_or_index> [-callsign <callsign>] [-rtl]")
 		fmt.Println("\nThis program captures a webcam and transmits it as NTSC video.")
 		fmt.Println("\nStep 1: Find your webcam's name or index (see README).")
 		fmt.Println("Step 2: Run this program with the correct arguments.")
 		fmt.Println("\nExample (Linux):    ./tvtx -freq 427.25 -device /dev/video0 -callsign N0CALL")
 		fmt.Println("Example (macOS):    ./tvtx -freq 427.25 -device 0 -callsign N0CALL")
 		fmt.Println("Example (Windows):  ./tvtx -freq 427.25 -device \"Integrated Webcam\" -callsign N0CALL")
+		fmt.Println("Example (RTL mode): ./tvtx -freq 427.25 -device /dev/video0 -rtl")
 		fmt.Println("\nOptions:")
 		flag.PrintDefaults()
 		os.Exit(1)
@@ -270,10 +272,19 @@ func main() {
 	defer dev.Close()
 
 	txFrequencyHz := uint64(*freq * 1_000_000)
+
+	var outputFrequency float64
+	if *rtl {
+		outputFrequency = 2_400_000
+	} else {
+		outputFrequency = float64(*sampleRate)
+	}
+
+	// Set HackRF frequency and sample rate
 	if err := dev.SetFreq(txFrequencyHz); err != nil {
 		log.Fatalf("SetFreq failed: %v", err)
 	}
-	if err := dev.SetSampleRate(float64(*sampleRate)); err != nil {
+	if err := dev.SetSampleRate(outputFrequency); err != nil {
 		log.Fatalf("SetSampleRate failed: %v", err)
 	}
 	if err := dev.SetTXVGAGain(*gain); err != nil {
@@ -283,7 +294,7 @@ func main() {
 		log.Fatalf("SetAmpEnable failed: %v", err)
 	}
 
-	ntsc := NewNTSC(float64(*sampleRate))
+	ntsc := NewNTSC(outputFrequency)
 
 	// Goroutine to read video frames from FFmpeg
 	go func() {
@@ -312,7 +323,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("Starting NTSC transmission on %.3f MHz...", float64(txFrequencyHz)/1e6)
+	log.Printf("Starting NTSC transmission on %.3f MHz at %.1f Hz sample rate...", float64(txFrequencyHz)/1e6, outputFrequency)
 
 	// Start HackRF Transmission
 	var sampleCounter int = 0
