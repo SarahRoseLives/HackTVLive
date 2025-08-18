@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/samuel/go-hackrf/hackrf"
 )
@@ -171,6 +172,33 @@ func (n *NTSC) ireToAmplitude(ire float64) float64 {
 	return ((ire - 100.0) / -140.0) * (1.0 - 0.125) + 0.125
 }
 
+// fillColorBars fills the rawFrameBuffer with a standard SMPTE color bars pattern
+func fillColorBars(buf []byte) {
+	// SMPTE color bars: 7 vertical stripes
+	barColors := [7][3]uint8{
+		{192, 192, 192}, // Gray
+		{192, 192, 0},   // Yellow
+		{0, 192, 192},   // Cyan
+		{0, 192, 0},     // Green
+		{192, 0, 192},   // Magenta
+		{192, 0, 0},     // Red
+		{0, 0, 192},     // Blue
+	}
+	barWidth := FrameWidth / 7
+	for y := 0; y < FrameHeight; y++ {
+		for x := 0; x < FrameWidth; x++ {
+			barIdx := x / barWidth
+			if barIdx >= 7 {
+				barIdx = 6
+			}
+			i := (y*FrameWidth + x) * 3
+			buf[i] = barColors[barIdx][0]
+			buf[i+1] = barColors[barIdx][1]
+			buf[i+2] = barColors[barIdx][2]
+		}
+	}
+}
+
 func main() {
 	// --- Command-Line Flag Setup ---
 	freq := flag.Float64("freq", 427.25, "Transmit frequency in MHz")
@@ -178,74 +206,112 @@ func main() {
 	gain := flag.Int("gain", 40, "TX VGA gain (0-47)")
 	device := flag.String("device", "", "Video device name or index (OS-dependent, see instructions)")
 	callsign := flag.String("callsign", "NOCALL", "Callsign to overlay on the video")
+	test := flag.Bool("test", false, "Show SMPTE colorbar test screen instead of webcam")
 	flag.Parse()
 
-	// --- Build the FFmpeg command based on the operating system ---
-	var ffmpegArgs []string
-	switch runtime.GOOS {
-	case "linux":
-		dev := *device
-		if dev == "" {
-			dev = "/dev/video0"
-		}
-		ffmpegArgs = []string{
-			"-f", "v4l2", "-i", dev,
-		}
-	case "darwin": // macOS
-		dev := *device
-		if dev == "" {
-			dev = "0"
-		}
-		ffmpegArgs = []string{
-			"-f", "avfoundation", "-i", dev,
-		}
-	case "windows":
-		dev := *device
-		if dev == "" {
-			dev = "Integrated Webcam"
-		}
-		ffmpegArgs = []string{
-			"-f", "dshow", "-i", "video=" + dev,
-		}
-	default:
-		log.Fatalf("Unsupported OS: %s", runtime.GOOS)
-	}
+	ntsc := NewNTSC(*bw * 1_000_000)
 
-	// Add common FFmpeg arguments with latency optimization flags
-	commonArgs := []string{
-		"-hide_banner", "-loglevel", "error",
-		"-fflags", "nobuffer",
-		"-flags", "low_delay",
-		"-probesize", "32",
-		"-analyzeduration", "0",
-		"-threads", "1",
-		"-f", "rawvideo",
-		"-pix_fmt", "rgb24",
-		"-vf",
-	}
-
-	// Compose the overlay filter if callsign is set
-	var vfArg string
-	if *callsign != "" {
-		// Overlay callsign: bottom left, white text, black box background for legibility
-		vfArg = fmt.Sprintf("scale=%d:%d,fps=30000/1001,drawbox=x=0:y=ih-40:w=iw:h=40:color=black@0.6:t=fill,drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='%s':x=10:y=h-35:fontcolor=white:fontsize=32:borderw=2:bordercolor=black", FrameWidth, FrameHeight, *callsign)
+	// --- Video source setup ---
+	var ffmpegCmd *exec.Cmd
+	if *test {
+		// Fill buffer with color bars
+		fillColorBars(ntsc.rawFrameBuffer)
+		log.Println("Test mode: SMPTE color bars will be transmitted.")
+		// In test mode, run frame generation loop at NTSC frame rate (~29.97 fps) until stopped
+		go func() {
+			ticker := time.NewTicker(time.Duration(1001*1000/30000) * time.Microsecond) // ~33.366ms
+			defer ticker.Stop()
+			for {
+				<-ticker.C
+				ntsc.ntscFrameMutex.Lock()
+				ntsc.GenerateFullFrame()
+				ntsc.ntscFrameMutex.Unlock()
+			}
+		}()
 	} else {
-		vfArg = fmt.Sprintf("scale=%d:%d,fps=30000/1001", FrameWidth, FrameHeight)
-	}
-	commonArgs = append(commonArgs, vfArg, "-")
-	ffmpegArgs = append(ffmpegArgs, commonArgs...)
+		// --- Build the FFmpeg command based on the operating system ---
+		var ffmpegArgs []string
+		switch runtime.GOOS {
+		case "linux":
+			dev := *device
+			if dev == "" {
+				dev = "/dev/video0"
+			}
+			ffmpegArgs = []string{
+				"-f", "v4l2", "-i", dev,
+			}
+		case "darwin": // macOS
+			dev := *device
+			if dev == "" {
+				dev = "0"
+			}
+			ffmpegArgs = []string{
+				"-f", "avfoundation", "-i", dev,
+			}
+		case "windows":
+			dev := *device
+			if dev == "" {
+				dev = "Integrated Webcam"
+			}
+			ffmpegArgs = []string{
+				"-f", "dshow", "-i", "video=" + dev,
+			}
+		default:
+			log.Fatalf("Unsupported OS: %s", runtime.GOOS)
+		}
 
-	ffmpegCmd := exec.Command("ffmpeg", ffmpegArgs...)
+		// Add common FFmpeg arguments with latency optimization flags
+		commonArgs := []string{
+			"-hide_banner", "-loglevel", "error",
+			"-fflags", "nobuffer",
+			"-flags", "low_delay",
+			"-probesize", "32",
+			"-analyzeduration", "0",
+			"-threads", "1",
+			"-f", "rawvideo",
+			"-pix_fmt", "rgb24",
+			"-vf",
+		}
 
-	// --- Start FFmpeg and the rest of the application ---
-	ffmpegStdout, err := ffmpegCmd.StdoutPipe()
-	if err != nil {
-		log.Fatalf("Failed to get FFmpeg stdout pipe: %v", err)
+		// Compose the overlay filter if callsign is set
+		var vfArg string
+		if *callsign != "" {
+			vfArg = fmt.Sprintf("scale=%d:%d,fps=30000/1001,drawbox=x=0:y=ih-40:w=iw:h=40:color=black@0.6:t=fill,drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='%s':x=10:y=h-35:fontcolor=white:fontsize=32:borderw=2:bordercolor=black", FrameWidth, FrameHeight, *callsign)
+		} else {
+			vfArg = fmt.Sprintf("scale=%d:%d,fps=30000/1001", FrameWidth, FrameHeight)
+		}
+		commonArgs = append(commonArgs, vfArg, "-")
+		ffmpegArgs = append(ffmpegArgs, commonArgs...)
+
+		ffmpegCmd = exec.Command("ffmpeg", ffmpegArgs...)
+
+		ffmpegStdout, err := ffmpegCmd.StdoutPipe()
+		if err != nil {
+			log.Fatalf("Failed to get FFmpeg stdout pipe: %v", err)
+		}
+		if err := ffmpegCmd.Start(); err != nil {
+			log.Fatalf("Failed to start FFmpeg: %v", err)
+		}
+		log.Println("FFmpeg process started to capture webcam...")
+
+		// Goroutine to read video frames from FFmpeg AS SOON AS THEY ARRIVE
+		go func() {
+			for {
+				_, err := io.ReadFull(ffmpegStdout, ntsc.rawFrameBuffer)
+				if err != nil {
+					if err == io.EOF {
+						log.Println("FFmpeg stream ended.")
+					} else {
+						log.Printf("Error reading from FFmpeg: %v", err)
+					}
+					break
+				}
+				ntsc.ntscFrameMutex.Lock()
+				ntsc.GenerateFullFrame()
+				ntsc.ntscFrameMutex.Unlock()
+			}
+		}()
 	}
-	if err := ffmpegCmd.Start(); err != nil {
-		log.Fatalf("Failed to start FFmpeg: %v", err)
-	}
-	log.Println("FFmpeg process started to capture webcam...")
 
 	// --- HackRF setup ---
 	if err := hackrf.Init(); err != nil {
@@ -275,27 +341,6 @@ func main() {
 		log.Fatalf("SetAmpEnable failed: %v", err)
 	}
 
-	ntsc := NewNTSC(outputFrequency)
-
-	// Goroutine to read video frames from FFmpeg AS SOON AS THEY ARRIVE
-	go func() {
-		for {
-			_, err := io.ReadFull(ffmpegStdout, ntsc.rawFrameBuffer)
-			if err != nil {
-				if err == io.EOF {
-					log.Println("FFmpeg stream ended.")
-				} else {
-					log.Printf("Error reading from FFmpeg: %v", err)
-				}
-				break
-			}
-			// Immediately trigger NTSC frame generation after a new frame is read
-			ntsc.ntscFrameMutex.Lock()
-			ntsc.GenerateFullFrame()
-			ntsc.ntscFrameMutex.Unlock()
-		}
-	}()
-
 	log.Printf("Starting NTSC transmission on %.3f MHz at %.1f Hz sample rate...", float64(txFrequencyHz)/1e6, outputFrequency)
 
 	// Start HackRF Transmission
@@ -323,5 +368,11 @@ func main() {
 		log.Fatalf("StartTX failed: %v", err)
 	}
 	log.Println("Transmission is live. Press Ctrl+C to stop.")
-	ffmpegCmd.Wait()
+	if ffmpegCmd != nil {
+		ffmpegCmd.Wait()
+	}
+	// In test mode, block forever (until Ctrl+C)
+	if *test {
+		select {}
+	}
 }
