@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"runtime"
 	"sync"
-	"time"
 
 	"github.com/samuel/go-hackrf/hackrf"
 )
@@ -203,7 +202,7 @@ func main() {
 	case "windows":
 		dev := *device
 		if dev == "" {
-			dev = "Integrated Webcam" // A common default
+			dev = "Integrated Webcam"
 		}
 		ffmpegArgs = []string{
 			"-f", "dshow", "-i", "video=" + dev,
@@ -212,9 +211,14 @@ func main() {
 		log.Fatalf("Unsupported OS: %s", runtime.GOOS)
 	}
 
-	// Add common FFmpeg arguments
+	// Add common FFmpeg arguments with latency optimization flags
 	commonArgs := []string{
 		"-hide_banner", "-loglevel", "error",
+		"-fflags", "nobuffer",
+		"-flags", "low_delay",
+		"-probesize", "32",
+		"-analyzeduration", "0",
+		"-threads", "1",
 		"-f", "rawvideo",
 		"-pix_fmt", "rgb24",
 		"-vf",
@@ -224,7 +228,6 @@ func main() {
 	var vfArg string
 	if *callsign != "" {
 		// Overlay callsign: bottom left, white text, black box background for legibility
-		// You may want to customize fontfile path or font size as needed
 		vfArg = fmt.Sprintf("scale=%d:%d,fps=30000/1001,drawbox=x=0:y=ih-40:w=iw:h=40:color=black@0.6:t=fill,drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='%s':x=10:y=h-35:fontcolor=white:fontsize=32:borderw=2:bordercolor=black", FrameWidth, FrameHeight, *callsign)
 	} else {
 		vfArg = fmt.Sprintf("scale=%d:%d,fps=30000/1001", FrameWidth, FrameHeight)
@@ -274,7 +277,7 @@ func main() {
 
 	ntsc := NewNTSC(outputFrequency)
 
-	// Goroutine to read video frames from FFmpeg
+	// Goroutine to read video frames from FFmpeg AS SOON AS THEY ARRIVE
 	go func() {
 		for {
 			_, err := io.ReadFull(ffmpegStdout, ntsc.rawFrameBuffer)
@@ -286,15 +289,7 @@ func main() {
 				}
 				break
 			}
-		}
-	}()
-
-	// NTSC Generator Goroutine
-	go func() {
-		frameDuration := time.Second / time.Duration(ntsc.frameRate)
-		ticker := time.NewTicker(frameDuration)
-		defer ticker.Stop()
-		for range ticker.C {
+			// Immediately trigger NTSC frame generation after a new frame is read
 			ntsc.ntscFrameMutex.Lock()
 			ntsc.GenerateFullFrame()
 			ntsc.ntscFrameMutex.Unlock()
