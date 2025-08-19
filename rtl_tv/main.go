@@ -1,12 +1,11 @@
-// NTSC receiver using github.com/jpoirier/gortlsdr (rtlsdr).
-// Pipes decoded video to VLC for display.
-// Copyright (c) 2025 SarahRoseLives - Updated by Gemini
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"sync"
@@ -16,153 +15,161 @@ import (
 
 // --- Configuration Constants ---
 const (
-	// Video parameters must match the transmitter
 	FrameWidth  = 540
 	FrameHeight = 480
 	FrameRate   = 30000.0 / 1001.0
 
-	// RTL-SDR parameters
-	SampleRate = 2_000_000   // 2.4 MHz, must match transmitter's -rtl mode
-	Frequency  = 427_250_000 // 427.25 MHz, target frequency
-	RtlGain    = 350         // Max gain for RTL-SDR v3 (49.6 dB)
+	RtlGain = 496 // Max gain for RTL-SDR v3 (49.6 dB)
 )
 
 // --- Decoder ---
-// The Decoder struct holds the state and logic for demodulating the NTSC signal.
 type Decoder struct {
-	// NTSC timing constants, calculated from the sample rate
-	samplesPerLine    int
-	activeStartSample int
-	activeSamples     int
-
-	// Frame buffer for the final RGB image sent to VLC
-	frameBuffer []byte
-	frameMutex  sync.Mutex
-
-	// State variables for building the frame
-	currentLine int
-
-	// Simple AGC (Automatic Gain Control) levels
-	// These are updated dynamically to adjust for signal strength changes.
-	blankLevel float64 // Represents the NTSC black level
-	peakLevel  float64 // Represents the NTSC white level
+	sampleRate            float64
+	samplesPerLine        float64
+	activeStartSample     int
+	activeSamples         int
+	hSyncWidthSamples     int
+	vSyncMinWidthSamples  int
+	frameBuffer           []byte
+	frameMutex            sync.Mutex
+	currentLine           int
+	lastSyncPos           int
+	whiteLevel            float64
+	blankLevel            float64
+	blackLevel            float64
+	frameFound            bool
 }
 
 // NewDecoder initializes a new NTSC decoder with the correct timing constants.
 func NewDecoder(sampleRate float64) *Decoder {
 	d := &Decoder{}
+	d.sampleRate = sampleRate
+	d.lastSyncPos = -1 // Initialize PLL
 
-	// An NTSC line has a duration of ~63.55 µs.
-	// We calculate how many samples that corresponds to at our sample rate.
-	lineDuration := 1.0 / (FrameRate * 525.0) // 525 lines per frame
-	d.samplesPerLine = int(lineDuration * sampleRate)
+	lineDuration := 1.0 / (FrameRate * 525.0)
+	d.samplesPerLine = lineDuration * sampleRate
 
-	// Based on the transmitter's timings, we calculate when the visible
-	// part of the video signal starts and how long it lasts, in samples.
-	activeVideoStartTime := 10.7e-6 // 10.7 µs
-	activeVideoDuration := 52.6e-6  // 52.6 µs
+	activeVideoStartTime := 10.7e-6
+	activeVideoDuration := 52.6e-6
+	hSyncDuration := 4.7e-6
+	vSyncDuration := 27.1e-6
+
 	d.activeStartSample = int(activeVideoStartTime * sampleRate)
 	d.activeSamples = int(activeVideoDuration * sampleRate)
+	d.hSyncWidthSamples = int(hSyncDuration * sampleRate)
+	d.vSyncMinWidthSamples = int(vSyncDuration * 0.8 * sampleRate)
 
-	// Allocate the buffer for one full frame of video (RGB24 format).
 	d.frameBuffer = make([]byte, FrameWidth*FrameHeight*3)
 
-	// Initialize AGC levels to reasonable defaults.
-	d.blankLevel = 5000.0
-	d.peakLevel = 15000.0
+	d.whiteLevel = 50.0
+	d.blankLevel = 100.0
+	d.blackLevel = 150.0
+	d.frameFound = false
 
 	return d
 }
 
-// processIQ is the core of the receiver. It takes a buffer of raw I/Q samples from the
-// SDR, demodulates it, finds the sync pulses, and builds the video frame.
-// It returns a complete frame when one is ready, otherwise it returns nil.
+// processIQ is the core of the receiver. It demodulates the signal, locks sync, and builds the video frame.
 func (d *Decoder) processIQ(iq []byte) []byte {
-	// 1. AM Demodulation
-	// We convert the complex I/Q samples into a simple amplitude signal.
-	// NTSC luminance is amplitude-modulated. We use magnitude squared to avoid
-	// costly square root operations; the relative amplitudes are all that matter.
 	amSignal := make([]float64, len(iq)/2)
 	for i := 0; i < len(amSignal); i++ {
 		iq_i := float64(int(iq[i*2]) - 127)
 		iq_q := float64(int(iq[i*2+1]) - 127)
-		amSignal[i] = (iq_i*iq_i + iq_q*iq_q)
+		amSignal[i] = math.Sqrt(iq_i*iq_i + iq_q*iq_q)
 	}
 
-	// 2. Synchronization and Line Decoding
-	// We scan through the demodulated signal, looking for horizontal sync pulses.
 	samplePtr := 0
-	for samplePtr < len(amSignal)-d.samplesPerLine {
-		// Find the minimum value in a window the size of one line.
-		// This minimum should be the tip of the HSYNC pulse.
+	samplesPerLineInt := int(d.samplesPerLine)
+
+	for samplePtr < len(amSignal)-samplesPerLineInt {
+		searchWindow := samplesPerLineInt
+		if searchWindow > len(amSignal)-samplePtr {
+			searchWindow = len(amSignal) - samplePtr
+		}
+
 		syncCandidatePos := -1
-		minVal := 1e12 // Start with a very large number
-		for i := 0; i < d.samplesPerLine; i++ {
-			if amSignal[samplePtr+i] < minVal {
-				minVal = amSignal[samplePtr+i]
+		maxVal := -1.0
+		for i := 0; i < searchWindow; i++ {
+			if amSignal[samplePtr+i] > maxVal {
+				maxVal = amSignal[samplePtr+i]
 				syncCandidatePos = samplePtr + i
 			}
 		}
 
-		if syncCandidatePos == -1 {
-			// Should not happen, but as a safeguard, we advance our pointer.
-			samplePtr += d.samplesPerLine
+		if d.lastSyncPos != -1 {
+			detectedLineLen := syncCandidatePos - d.lastSyncPos
+			if float64(detectedLineLen) > d.samplesPerLine*0.9 && float64(detectedLineLen) < d.samplesPerLine*1.1 {
+				d.samplesPerLine = d.samplesPerLine*0.99 + float64(detectedLineLen)*0.01
+			}
+		}
+		d.lastSyncPos = syncCandidatePos
+		samplesPerLineInt = int(d.samplesPerLine)
+
+		lineStart := syncCandidatePos
+		if lineStart+samplesPerLineInt > len(amSignal) {
+			break
+		}
+
+		syncThreshold := (d.blankLevel + d.blackLevel) / 2.0
+		pulseWidth := 0
+		for i := syncCandidatePos; i > syncCandidatePos-d.hSyncWidthSamples*2 && i > 0; i-- {
+			if amSignal[i] < syncThreshold {
+				break
+			}
+			pulseWidth++
+		}
+		for i := syncCandidatePos + 1; i < syncCandidatePos+d.hSyncWidthSamples*2 && i < len(amSignal); i++ {
+			if amSignal[i] < syncThreshold {
+				break
+			}
+			pulseWidth++
+		}
+
+		if pulseWidth >= d.vSyncMinWidthSamples {
+			d.currentLine = 0
+			samplePtr = lineStart + samplesPerLineInt
 			continue
 		}
 
-		// The start of the line is the HSYNC pulse position.
-		lineStart := syncCandidatePos
-		if lineStart+d.samplesPerLine > len(amSignal) {
-			break // Not enough data left in this buffer for a full line.
-		}
-
-		// Extract the active video portion of this synchronized line.
 		activeVideoStart := lineStart + d.activeStartSample
 		if activeVideoStart+d.activeSamples > len(amSignal) {
-			// Not enough data for the active video, so we'll skip this line
-			// and search for the next sync pulse.
 			samplePtr = lineStart + 1
 			continue
 		}
 		lineSamples := amSignal[activeVideoStart : activeVideoStart+d.activeSamples]
 
-		// 3. Simple AGC: Adjust black/white levels dynamically
-		// We use the "back porch" (the period just after HSYNC) as our reference for black.
-		// By assigning the result to a variable first, the conversion to int
-		// becomes a runtime operation, where truncation is allowed.
-		backPorchOffset := 5.6e-6 * float64(SampleRate)
+		backPorchOffset := 5.6e-6 * d.sampleRate
 		backPorchStart := lineStart + int(backPorchOffset)
-
 		if backPorchStart < len(amSignal) {
 			d.blankLevel = d.blankLevel*0.995 + amSignal[backPorchStart]*0.005
 		}
-		// Find the peak value in the active video to use as our white reference.
-		maxInLine := 0.0
+		maxInLine, minInLine := 0.0, 1e12
 		for _, s := range lineSamples {
 			if s > maxInLine {
 				maxInLine = s
 			}
+			if s < minInLine {
+				minInLine = s
+			}
 		}
-		d.peakLevel = d.peakLevel*0.995 + maxInLine*0.005
+		d.blackLevel = d.blackLevel*0.995 + maxInLine*0.005
+		d.whiteLevel = d.whiteLevel*0.995 + minInLine*0.005
 
-		// 4. Resampling and Pixel Generation
-		// We map the ~126 active video samples to our 540 output pixels.
 		if d.currentLine < FrameHeight {
 			d.frameMutex.Lock()
 			for pixelX := 0; pixelX < FrameWidth; pixelX++ {
-				// Find the corresponding source sample for this destination pixel.
-				srcIndex := int(float64(pixelX) / float64(FrameWidth) * float64(len(lineSamples)))
-
-				// Normalize the sample's amplitude to a 0-255 grayscale value
-				// using our dynamic black/white levels.
-				levelRange := d.peakLevel - d.blankLevel
-				if levelRange < 1.0 {
-					levelRange = 1.0 // Avoid division by zero
+				// Fix: Map every pixel to a sample, clamp to valid range
+				srcIndex := int(float64(pixelX) * float64(len(lineSamples)) / float64(FrameWidth))
+				if srcIndex >= len(lineSamples) {
+					srcIndex = len(lineSamples) - 1
 				}
-				normalizedVal := (lineSamples[srcIndex] - d.blankLevel) / levelRange
+				levelRange := d.blankLevel - d.whiteLevel
+				if levelRange < 1.0 {
+					levelRange = 1.0
+				}
+				normalizedVal := (d.blankLevel - lineSamples[srcIndex]) / levelRange
 				gray := int(normalizedVal * 255.0)
 
-				// Clamp the value to the valid 0-255 range.
 				if gray < 0 {
 					gray = 0
 				}
@@ -170,73 +177,78 @@ func (d *Decoder) processIQ(iq []byte) []byte {
 					gray = 255
 				}
 
-				// Write the grayscale pixel to our frame buffer (R=G=B).
 				offset := (d.currentLine*FrameWidth + pixelX) * 3
 				d.frameBuffer[offset+0] = byte(gray)
 				d.frameBuffer[offset+1] = byte(gray)
 				d.frameBuffer[offset+2] = byte(gray)
 			}
 			d.frameMutex.Unlock()
+			d.frameFound = true
 		}
 
-		// We've processed a line, move to the next one.
 		d.currentLine++
-		samplePtr = lineStart + d.samplesPerLine // Advance pointer to the next line
+		samplePtr = lineStart + samplesPerLineInt
 
-		// 5. Frame Completion
-		// If we've filled all the lines, we have a complete frame.
 		if d.currentLine >= FrameHeight {
-			d.currentLine = 0 // Reset for the next frame
+			d.currentLine = 0
 			d.frameMutex.Lock()
 			frameCopy := make([]byte, len(d.frameBuffer))
-			copy(frameCopy, d.frameBuffer) // Return a copy
+			copy(frameCopy, d.frameBuffer)
 			d.frameMutex.Unlock()
 			return frameCopy
 		}
 	}
-
-	// We processed the whole buffer but didn't complete a frame.
+	// If no frame detected, output static (gray noise)
+	if !d.frameFound {
+		frame := make([]byte, FrameWidth*FrameHeight*3)
+		for i := 0; i < FrameWidth*FrameHeight; i++ {
+			gray := byte(128 + int(32*math.Sin(float64(i))))
+			frame[i*3+0] = gray
+			frame[i*3+1] = gray
+			frame[i*3+2] = gray
+		}
+		return frame
+	}
 	return nil
 }
 
 // --- Main Application ---
 
-// startVLCPipe launches VLC in a separate process, configured to display
-// a raw RGB video stream from its standard input.
-func startVLCPipe() (io.WriteCloser, *exec.Cmd, error) {
-	vlcPath, err := exec.LookPath("vlc")
+func startFFplayPipe() (io.WriteCloser, *exec.Cmd, error) {
+	ffplayPath, err := exec.LookPath("ffplay")
 	if err != nil {
-		return nil, nil, fmt.Errorf("VLC not found in your PATH. Please install VLC media player")
+		return nil, nil, fmt.Errorf("FFplay not found in your PATH")
 	}
-
 	args := []string{
-		"--demux", "rawvideo",
-		"--rawvid-fps", fmt.Sprintf("%f", FrameRate),
-		"--rawvid-width", fmt.Sprintf("%d", FrameWidth),
-		"--rawvid-height", fmt.Sprintf("%d", FrameHeight),
-		"--rawvid-chroma", "RV24", // RGB 24-bit
-		"-", // Read from stdin
+		"-f", "rawvideo",
+		"-pixel_format", "rgb24",
+		"-video_size", fmt.Sprintf("%dx%d", FrameWidth, FrameHeight),
+		"-framerate", fmt.Sprintf("%f", FrameRate),
+		"-i", "-",
 	}
-
-	cmd := exec.Command(vlcPath, args...)
+	cmd := exec.Command(ffplayPath, args...)
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, nil, err
 	}
-	cmd.Stderr = os.Stderr // Show VLC errors in the console
-
+	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		return nil, nil, err
 	}
-
-	log.Println("VLC process started. Video output should appear in a new window.")
+	log.Println("FFplay process started. Video output should appear in a new window.")
 	return stdinPipe, cmd, nil
 }
 
 func main() {
+	bw := flag.Float64("bw", 2.4, "SDR sample rate (bandwidth) in MHz")
+	freq := flag.Float64("freq", 427.25, "SDR center frequency in MHz")
+	flag.Parse()
+
+	sampleRateHz := *bw * 1_000_000
+	frequencyHz := *freq * 1_000_000
+
 	log.Println("Starting RTL-SDR NTSC receiver...")
 
-	// --- Initialize RTL-SDR Device ---
 	devCount := rtl.GetDeviceCount()
 	if devCount == 0 {
 		log.Fatal("No RTL-SDR devices found.")
@@ -249,19 +261,17 @@ func main() {
 	}
 	defer dongle.Close()
 
-	// --- Configure Device Settings ---
-	if err := dongle.SetCenterFreq(Frequency); err != nil {
+	if err := dongle.SetCenterFreq(int(frequencyHz)); err != nil {
 		log.Fatalf("SetCenterFreq failed: %v", err)
 	}
-	log.Printf("Tuned to frequency: %.3f MHz\n", float64(Frequency)/1e6)
+	log.Printf("Tuned to frequency: %.3f MHz\n", frequencyHz/1e6)
 
-	if err := dongle.SetSampleRate(SampleRate); err != nil {
+	if err := dongle.SetSampleRate(int(sampleRateHz)); err != nil {
 		log.Fatalf("SetSampleRate failed: %v", err)
 	}
-	log.Printf("Sample rate set to: %.3f MHz\n", float64(SampleRate)/1e6)
+	log.Printf("Sample rate set to: %.3f MHz\n", sampleRateHz/1e6)
 
-	// Set gain to a high value. You may need to adjust this.
-	if err := dongle.SetTunerGainMode(false); err != nil { // false = manual gain
+	if err := dongle.SetTunerGainMode(false); err != nil {
 		log.Fatalf("SetTunerGainMode failed: %v", err)
 	}
 	if err := dongle.SetTunerGain(RtlGain); err != nil {
@@ -273,19 +283,16 @@ func main() {
 		log.Fatalf("ResetBuffer failed: %v", err)
 	}
 
-	// --- Start VLC Pipe ---
-	vlcPipe, vlcCmd, err := startVLCPipe()
+	ffplayPipe, ffplayCmd, err := startFFplayPipe()
 	if err != nil {
-		log.Fatalf("Failed to start VLC: %v", err)
+		log.Fatalf("Failed to start FFplay: %v", err)
 	}
-	defer vlcCmd.Process.Kill()
-	defer vlcPipe.Close()
+	defer ffplayCmd.Process.Kill()
+	defer ffplayPipe.Close()
 
-	// --- Main Processing Loop ---
-	decoder := NewDecoder(SampleRate)
+	decoder := NewDecoder(sampleRateHz)
 	log.Println("Starting stream processing. Looking for NTSC signal...")
 
-	// Use the recommended buffer size for synchronous reading
 	readBuffer := make([]byte, rtl.DefaultBufLength)
 
 	for {
@@ -294,20 +301,15 @@ func main() {
 			log.Printf("ReadSync error: %v", err)
 			break
 		}
-
-		if bytesRead != len(readBuffer) {
-			log.Printf("Warning: short read (%d / %d bytes)", bytesRead, len(readBuffer))
+		if bytesRead == 0 {
 			continue
 		}
 
-		// Process the received IQ data. This function will return a full frame
-		// when one has been successfully decoded.
-		frame := decoder.processIQ(readBuffer)
+		frame := decoder.processIQ(readBuffer[:bytesRead])
 		if frame != nil {
-			// We have a frame! Write it to VLC's stdin.
-			if _, err := vlcPipe.Write(frame); err != nil {
-				log.Println("Error writing to VLC pipe. VLC may have been closed.")
-				break // Exit the loop if VLC is closed.
+			if _, err := ffplayPipe.Write(frame); err != nil {
+				log.Println("Error writing to FFplay pipe. FFplay may have been closed.")
+				break
 			}
 		}
 	}
