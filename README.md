@@ -53,14 +53,6 @@ Linux:
 ```sh
 ./HackTVLive -freq 427.25 -bw 6 -gain 40 -device /dev/video0 -callsign N0CALL
 ```
-macOS:
-```sh
-./HackTVLive -freq 427.25 -bw 6 -gain 40 -device 0 -callsign N0CALL
-```
-Windows:
-```sh
-./HackTVLive -freq 427.25 -bw 6 -gain 40 -device "Integrated Webcam" -callsign N0CALL
-```
 
 ## Experimentation
 
