@@ -12,7 +12,6 @@ import (
 	"hacktvlive/sdr"
 	"hacktvlive/source"
 	"hacktvlive/video"
-
 )
 
 func main() {
@@ -30,14 +29,14 @@ func main() {
 	}
 	defer dev.Close()
 
-	// 2. Select the video standard (NTSC or PAL)
+	// 2. Select the video standard (NTSC or PAL) using the fixed sample rate
 	var videoStandard video.Standard
 	var frameTick time.Duration
 	if cfg.PAL {
-		videoStandard = video.NewPAL(cfg.SampleRate)
+		videoStandard = video.NewPAL(config.FixedSampleRate)
 		frameTick = time.Second / 25
 	} else {
-		videoStandard = video.NewNTSC(cfg.SampleRate)
+		videoStandard = video.NewNTSC(config.FixedSampleRate)
 		frameTick = time.Second * 1001 / 30000
 	}
 

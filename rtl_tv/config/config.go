@@ -31,9 +31,9 @@ type AppConfig struct {
 
 // ParseFlags parses command-line flags and returns an AppConfig.
 func ParseFlags() *AppConfig {
-	bw := flag.Float64("bw", 1.5, "SDR sample rate (bandwidth) in MHz")
+	bw := flag.Float64("bw", 2.4, "SDR sample rate (bandwidth) in MHz")
 	freq := flag.Float64("freq", 1280, "SDR center frequency in MHz")
-	gain := flag.Int("gain", 496, "SDR tuner gain in tenths of a dB (e.g., 496 for 49.6 dB)")
+	gain := flag.Int("gain", 300, "SDR tuner gain in tenths of a dB (e.g., 496 for 49.6 dB)")
 	flag.Parse()
 
 	return &AppConfig{
