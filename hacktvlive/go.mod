@@ -1,4 +1,4 @@
-module HackTVLive
+module hacktvlive
 
 go 1.24.0
 
